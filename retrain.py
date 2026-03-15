@@ -1,8 +1,9 @@
 # retrain.py
 # Run after generate_sf_labels.py finishes
-# Reads sf_dataset.pt
-# Retrains on accurate Stockfish evaluations
-# Starts from existing evaluator.pt weights
+# Uses sf_dataset.pt ONLY — accurate Stockfish labels
+# No mixing with noisy win/loss labels
+# CombinedLoss fixes conservative predictions
+# Correctly tuned OneCycleLR warmup
 # Output: evaluator.pt (final best version)
 
 import torch
@@ -20,12 +21,23 @@ torch.set_float32_matmul_precision("high")
 
 class TensorChessDataset(Dataset):
     def __init__(self, pt_file: str):
-        print(f"Loading dataset from {pt_file}...")
+        print(f"Loading {pt_file}...")
         data = torch.load(pt_file, weights_only=False)
         self.positions = data["positions"].float()
         self.scores    = data["scores"].float()
         print(f"Loaded {len(self.positions):,} positions")
         print(f"Tensor shape: {self.positions.shape}")
+
+        # Sanity check
+        s = self.scores.numpy()
+        decisive = (np.abs(s) > 0.1).sum()
+        draws    = len(s) - decisive
+        print(f"Decisive: {decisive:,} ({decisive/len(s)*100:.1f}%)")
+        print(f"Near-draw:{draws:,} ({draws/len(s)*100:.1f}%)")
+        if decisive / len(s) > 0.7:
+            print("✅ Win-focused distribution confirmed")
+        else:
+            print("⚠️  Still draw-heavy — did you regenerate sf_dataset.pt?")
 
     def __len__(self):
         return len(self.positions)
@@ -99,14 +111,12 @@ class Evaluator(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-
 class CombinedLoss(nn.Module):
     """
-    Standard MSE + extra penalty for extreme positions
-    predicted too conservatively.
-
-    extreme_weight controls how hard — 0.5 = moderate
-    increase to 1.0 or 2.0 if predictions still too narrow
+    MSE + extra penalty on extreme positions predicted conservatively
+    extreme_threshold: positions beyond this are considered decisive
+    extreme_weight:    how hard to penalize conservative predictions
+                       0.5 = moderate, 1.0 = strong, 2.0 = very strong
     """
     def __init__(self, extreme_threshold=0.5, extreme_weight=0.5):
         super().__init__()
@@ -114,27 +124,19 @@ class CombinedLoss(nn.Module):
         self.extreme_weight    = extreme_weight
 
     def forward(self, pred, target):
-        # Base MSE loss — same as before
-        base_loss = F.mse_loss(pred, target)
-
-        # Extra penalty on extreme positions
-        # extreme_mask = positions where SF says clearly winning/losing
+        base_loss    = F.mse_loss(pred, target)
         extreme_mask = target.abs() > self.extreme_threshold
-
         if extreme_mask.sum() > 0:
             extreme_loss = F.mse_loss(
-                pred[extreme_mask],
-                target[extreme_mask]
+                pred[extreme_mask], target[extreme_mask]
             )
             return base_loss + self.extreme_weight * extreme_loss
-
         return base_loss
 
 
 def collect_predictions(model, val_prefetcher):
     model.eval()
-    all_preds  = []
-    all_labels = []
+    all_preds, all_labels = [], []
     with torch.no_grad():
         for x, y in val_prefetcher:
             with torch.amp.autocast("cuda"):
@@ -144,7 +146,7 @@ def collect_predictions(model, val_prefetcher):
     return np.array(all_preds), np.array(all_labels)
 
 
-def plot_results(train_losses, val_losses, model, val_loader, device):
+def plot_results(train_losses, val_losses, model, val_loader, device, n_total):
     val_prefetcher        = CUDAPrefetcher(val_loader, device)
     all_preds, all_labels = collect_predictions(model, val_prefetcher)
     errors                = all_preds - all_labels
@@ -158,7 +160,7 @@ def plot_results(train_losses, val_losses, model, val_loader, device):
     ax.plot(val_losses,   label="Val Loss",   marker="o")
     ax.axvline(best_epoch, color="red", linestyle="--",
                label=f"Best epoch ({best_epoch+1})")
-    ax.set_title("Loss Curves (SF Labels)")
+    ax.set_title("Loss Curves (SF Labels Only)")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("MSE Loss")
     ax.legend()
@@ -175,11 +177,10 @@ def plot_results(train_losses, val_losses, model, val_loader, device):
     ax.grid(True)
 
     # Plot 3 — Prediction distribution
-    # After conservative fix — blue should spread wider matching orange
     ax = axes[0, 2]
     ax.hist(all_preds,  bins=60, alpha=0.7, label="Predictions", color="steelblue")
-    ax.hist(all_labels, bins=60, alpha=0.7, label="Actual",      color="orange")
-    ax.set_title("Prediction Distribution (blue should match orange width)")
+    ax.hist(all_labels, bins=60, alpha=0.7, label="SF Labels",   color="orange")
+    ax.set_title("Prediction Distribution (blue should match orange)")
     ax.set_xlabel("Score")
     ax.set_ylabel("Count")
     ax.legend()
@@ -190,7 +191,7 @@ def plot_results(train_losses, val_losses, model, val_loader, device):
     ax.hist(errors, bins=60, color="purple", alpha=0.8)
     ax.axvline(0, color="red", linestyle="--", label="Zero error")
     ax.axvline(errors.mean(), color="orange", linestyle="--",
-               label=f"Mean error: {errors.mean():.4f}")
+               label=f"Mean: {errors.mean():.4f}")
     ax.set_title("Error Distribution (Pred - Actual)")
     ax.set_xlabel("Error")
     ax.set_ylabel("Count")
@@ -216,18 +217,13 @@ def plot_results(train_losses, val_losses, model, val_loader, device):
         accuracies.append(correct[mask].mean() * 100 if mask.sum() > 0 else 0)
         counts.append(mask.sum())
 
-    bars = ax.bar(
-        categories, accuracies,
-        color=["white", "gray", "black"],
-        edgecolor="black", linewidth=1.2
-    )
+    bars = ax.bar(categories, accuracies,
+                  color=["white", "gray", "black"],
+                  edgecolor="black", linewidth=1.2)
     for bar, acc, cnt in zip(bars, accuracies, counts):
-        ax.text(
-            bar.get_x() + bar.get_width()/2,
-            bar.get_height() + 1,
-            f"{acc:.1f}%\n(n={cnt:,})",
-            ha="center", va="bottom", fontsize=9
-        )
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                f"{acc:.1f}%\n(n={cnt:,})",
+                ha="center", va="bottom", fontsize=9)
     ax.set_title("Outcome Classification Accuracy")
     ax.set_xlabel("True Outcome")
     ax.set_ylabel("Accuracy (%)")
@@ -237,23 +233,22 @@ def plot_results(train_losses, val_losses, model, val_loader, device):
     # Plot 6 — Summary stats
     ax = axes[1, 2]
     ax.axis("off")
-    mae         = np.abs(errors).mean()
-    rmse        = np.sqrt((errors**2).mean())
-    overall_acc = correct.mean() * 100
-
-    # Check if conservative prediction is fixed
-    pred_std   = all_preds.std()
-    label_std  = all_labels.std()
+    mae          = np.abs(errors).mean()
+    rmse         = np.sqrt((errors**2).mean())
+    overall_acc  = correct.mean() * 100
+    pred_std     = all_preds.std()
+    label_std    = all_labels.std()
     spread_ratio = pred_std / label_std if label_std > 0 else 0
     spread_status = (
-        "FIXED" if spread_ratio > 0.7
-        else "IMPROVING" if spread_ratio > 0.4
-        else "STILL CONSERVATIVE"
+        "FIXED"              if spread_ratio > 0.7 else
+        "IMPROVING"          if spread_ratio > 0.4 else
+        "STILL CONSERVATIVE"
     )
 
     summary = (
-        f"Dataset:          sf_dataset.pt\n"
-        f"Dataset size:     {len(all_labels) * 10:,} (val={len(all_labels):,})\n"
+        f"Dataset:          sf_dataset.pt only\n"
+        f"Total positions:  {n_total:,}\n"
+        f"Val positions:    {len(all_labels):,}\n"
         f"Best epoch:       {best_epoch + 1}\n"
         f"Best val loss:    {min(val_losses):.4f}\n\n"
         f"MAE:              {mae:.4f}\n"
@@ -270,17 +265,13 @@ def plot_results(train_losses, val_losses, model, val_loader, device):
         f"Status:           {'GOOD' if min(val_losses) < 0.25 else 'NEEDS MORE TRAINING'}"
     )
 
-    ax.text(
-        0.1, 0.9, summary, transform=ax.transAxes,
-        fontsize=11, verticalalignment="top", fontfamily="monospace",
-        bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8)
-    )
+    ax.text(0.1, 0.9, summary, transform=ax.transAxes,
+            fontsize=11, verticalalignment="top", fontfamily="monospace",
+            bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
     ax.set_title("Summary Statistics")
 
-    plt.suptitle(
-        "Chess Evaluator — Retrain Results (Stockfish Labels)",
-        fontsize=14, fontweight="bold"
-    )
+    plt.suptitle("Chess Evaluator — Retrain Results (SF Labels Only)",
+                 fontsize=14, fontweight="bold")
     plt.tight_layout()
     plt.savefig("training_results_retrain.png", dpi=150)
     plt.show()
@@ -294,10 +285,16 @@ def main():
         props = torch.cuda.get_device_properties(0)
         print(f"GPU: {props.name}  VRAM: {props.total_memory/1e9:.1f} GB")
 
-    dataset  = TensorChessDataset("sf_dataset.pt")
-    train_n  = int(0.9 * len(dataset))
-    val_n    = len(dataset) - train_n
+    # ── Load sf_dataset.pt only ───────────────────────────────────────────────
+    print("\nLoading sf_dataset.pt...")
+    dataset = TensorChessDataset("sf_dataset.pt")
+    n_total = len(dataset)
+
+    train_n = int(0.9 * n_total)
+    val_n   = n_total - train_n
     train_ds, val_ds = random_split(dataset, [train_n, val_n])
+
+    print(f"\nTrain: {train_n:,}  Val: {val_n:,}")
 
     LOADER_KWARGS = dict(
         batch_size         = 16384,
@@ -308,6 +305,10 @@ def main():
     train_loader = DataLoader(train_ds, shuffle=True,  **LOADER_KWARGS)
     val_loader   = DataLoader(val_ds,   shuffle=False, **LOADER_KWARGS)
 
+    print(f"Train batches: {len(train_loader):,}")
+    print(f"Val batches:   {len(val_loader):,}")
+
+    # ── Model ─────────────────────────────────────────────────────────────────
     model = Evaluator().to(device)
 
     if sys.platform != "win32":
@@ -319,6 +320,7 @@ def main():
     else:
         print("torch.compile: skipped (Windows)")
 
+    # ── Load existing weights ─────────────────────────────────────────────────
     try:
         state = torch.load(
             "evaluator.pt", map_location=device, weights_only=True
@@ -326,28 +328,46 @@ def main():
         (model._orig_mod if hasattr(model, "_orig_mod") else model
          ).load_state_dict(state)
         print("Starting from existing evaluator.pt weights")
-        lr = 5e-5
+        base_lr = 1e-4
     except FileNotFoundError:
         print("No existing weights — starting fresh")
-        lr = 1e-3
+        base_lr = 1e-3
 
+    # ── Optimizer ─────────────────────────────────────────────────────────────
     epochs    = 30
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=1e-4
+        model.parameters(),
+        lr           = base_lr,
+        weight_decay = 1e-4
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer,
-    T_max   = epochs * len(train_loader),  # total steps
-    eta_min = 1e-7
+
+    # ── Scheduler — correctly tuned warmup ───────────────────────────────────
+    # div_factor=3.0 means starts at base_lr (not lower)
+    # pct_start=0.05 = 5% warmup = ~1.5 epochs
+    # final_div_factor=1000 = ends at base_lr/1000
+    # This fixes best epoch=1 problem from previous runs
+    total_steps = epochs * len(train_loader)
+    scheduler   = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr           = base_lr * 3,
+        total_steps      = total_steps,
+        pct_start        = 0.05,
+        anneal_strategy  = "cos",
+        div_factor       = 3.0,
+        final_div_factor = 1000.0,
     )
 
     criterion = CombinedLoss(extreme_threshold=0.5, extreme_weight=0.5)
-
-    scaler = torch.amp.GradScaler("cuda")
+    scaler    = torch.amp.GradScaler("cuda")
 
     best_val_loss = float("inf")
     train_losses  = []
     val_losses    = []
+
+    print(f"\nTraining for {epochs} epochs")
+    print(f"Base LR:  {base_lr:.0e}")
+    print(f"Peak LR:  {base_lr*3:.0e}")
+    print(f"Warmup:   5% = {int(total_steps*0.05):,} steps\n")
 
     for epoch in range(epochs):
         model.train()
@@ -386,13 +406,15 @@ def main():
             for x, y in val_prefetcher:
                 with torch.amp.autocast("cuda"):
                     pred = model(x)
-                    # Use plain MSE for val loss — comparable across runs
-                    loss = F.mse_loss(pred, y)
+                    loss = F.mse_loss(pred, y)  # plain MSE for val
                 val_loss += loss.item()
         val_loss /= len(val_loader)
         val_losses.append(val_loss)
 
-        print(f"\nEpoch {epoch+1:>2} | train={train_loss:.4f} | val={val_loss:.4f}")
+        print(f"\nEpoch {epoch+1:>2} | "
+              f"train={train_loss:.4f} | "
+              f"val={val_loss:.4f} | "
+              f"lr={scheduler.get_last_lr()[0]:.2e}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -410,7 +432,7 @@ def main():
     state = torch.load("evaluator.pt", weights_only=True)
     (model._orig_mod if hasattr(model, "_orig_mod") else model
      ).load_state_dict(state)
-    plot_results(train_losses, val_losses, model, val_loader, device)
+    plot_results(train_losses, val_losses, model, val_loader, device, n_total)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import chess
 import chess.engine
+import chess.polyglot
 import torch
 import torch.nn as nn
 import numpy as np
@@ -139,9 +140,51 @@ def get_sf_move_order(board):
             reverse=True
         )
 
+def quiescence(board, alpha, beta, maximizing, qs_depth=8):
+    """Search captures until the position is quiet."""
+    stand_pat = nn_score(board)
+
+    if qs_depth == 0:
+        return stand_pat
+
+    if maximizing:
+        if stand_pat >= beta:
+            return stand_pat
+        alpha = max(alpha, stand_pat)
+
+        for move in sorted(
+            (m for m in board.legal_moves if board.is_capture(m)),
+            key=lambda m: board.gives_check(m), reverse=True
+        ):
+            board.push(move)
+            score = quiescence(board, alpha, beta, False, qs_depth - 1)
+            board.pop()
+            if score >= beta:
+                return score
+            alpha = max(alpha, score)
+        return alpha
+    else:
+        if stand_pat <= alpha:
+            return stand_pat
+        beta = min(beta, stand_pat)
+
+        for move in sorted(
+            (m for m in board.legal_moves if board.is_capture(m)),
+            key=lambda m: board.gives_check(m), reverse=True
+        ):
+            board.push(move)
+            score = quiescence(board, alpha, beta, True, qs_depth - 1)
+            board.pop()
+            if score <= alpha:
+                return score
+            beta = min(beta, score)
+        return beta
+
 def alpha_beta(board, depth, alpha, beta, maximizing):
-    if depth == 0 or board.is_game_over():
+    if board.is_game_over():
         return nn_score(board)
+    if depth == 0:
+        return quiescence(board, alpha, beta, maximizing)
     moves = sorted(
         board.legal_moves,
         key=lambda m: (board.is_capture(m), board.gives_check(m)),
@@ -166,10 +209,45 @@ def alpha_beta(board, depth, alpha, beta, maximizing):
             if beta <= alpha: break
         return value
 
+BOOK_PATH = "openingBook/Perfect2023.bin"
+
+def get_book_move(board):
+    """
+    Looks up current position in opening book.
+    weighted_choice picks moves proportionally to their weight —
+    plays varied openings, not always the same line.
+    """
+    try:
+        with chess.polyglot.open_reader(BOOK_PATH) as reader:
+            entry = reader.weighted_choice(board)
+            return entry.move
+    except (IndexError, FileNotFoundError, Exception):
+        return None
+
+def get_best_book_move(board):
+    """
+    Always picks the highest weighted move.
+    More consistent but less varied — better for bot vs bot competition.
+    """
+    try:
+        with chess.polyglot.open_reader(BOOK_PATH) as reader:
+            entry = max(reader.find_all(board), key=lambda e: e.weight)
+            return entry.move
+    except Exception:
+        return None
+
 def best_move(board, depth=3):
+    # 1. Check opening book first — always strongest in opening
+    book_move = get_best_book_move(board)
+    if book_move and book_move in board.legal_moves:
+        return book_move
+
+    # 2. SF move ordering at root
     ordered_moves = get_sf_move_order(board)
     if not ordered_moves:
         return None
+
+    # 3. Alpha-beta with the neural net
     best, best_val = None, -float('inf')
     alpha          = -float('inf')
     for move in ordered_moves:
