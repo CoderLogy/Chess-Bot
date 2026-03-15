@@ -180,7 +180,8 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-.pt
-.pgn
-.exe
+dataset.pt
+sf_dataset.pt
+*.pgn
+*.exe
 .bat
