@@ -185,3 +185,5 @@ sf_dataset.pt
 *.pgn
 *.exe
 .bat
+*nnue-pytorch
+*__pycache__

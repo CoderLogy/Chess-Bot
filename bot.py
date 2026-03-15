@@ -1,3 +1,4 @@
+#built search and sorting by hand but let ai handle rest
 import chess
 import chess.engine
 import chess.polyglot
@@ -6,7 +7,7 @@ import torch.nn as nn
 import numpy as np
 import sys
 
-# Must match train.py exactly
+
 class Evaluator(nn.Module):
     def __init__(self):
         super().__init__()
@@ -140,7 +141,7 @@ def get_sf_move_order(board):
             reverse=True
         )
 
-def quiescence(board, alpha, beta, maximizing, qs_depth=8):
+def quiescence(board, alpha, beta, maximizing, qs_depth=3):
     """Search captures until the position is quiet."""
     stand_pat = nn_score(board)
 
@@ -296,8 +297,8 @@ def uci_loop():
             btime     = int(parts[parts.index("btime")+1]) if "btime" in parts else 60000
             time_left = wtime if board.turn == chess.WHITE else btime
 
-            if time_left > 60000:   depth = 4
-            elif time_left > 20000: depth = 3
+            if time_left > 60000:   depth = 3
+            elif time_left > 20000: depth = 2
             else:                   depth = 1
 
             move = best_move(board, depth=depth)

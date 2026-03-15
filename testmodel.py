@@ -1,6 +1,6 @@
 # test_model.py
 # Run after train.py to verify evaluator.pt is working correctly
-# Tests: model loads, evaluates positions correctly,
+#built with ai
 #scores make intuitive sense, inference speed
 
 import chess

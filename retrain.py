@@ -1,10 +1,7 @@
-# retrain.py
 # Run after generate_sf_labels.py finishes
-# Uses sf_dataset.pt ONLY — accurate Stockfish labels
-# No mixing with noisy win/loss labels
 # CombinedLoss fixes conservative predictions
-# Correctly tuned OneCycleLR warmup
 # Output: evaluator.pt (final best version)
+#used ai for generating graphs
 
 import torch
 import torch.nn as nn
@@ -118,7 +115,7 @@ class CombinedLoss(nn.Module):
     extreme_weight:    how hard to penalize conservative predictions
                        0.5 = moderate, 1.0 = strong, 2.0 = very strong
     """
-    def __init__(self, extreme_threshold=0.5, extreme_weight=0.5):
+    def __init__(self, extreme_threshold=1, extreme_weight=1):
         super().__init__()
         self.extreme_threshold = extreme_threshold
         self.extreme_weight    = extreme_weight
@@ -357,7 +354,7 @@ def main():
         final_div_factor = 1000.0,
     )
 
-    criterion = CombinedLoss(extreme_threshold=0.5, extreme_weight=0.5)
+    criterion = CombinedLoss(extreme_threshold=1, extreme_weight=1)
     scaler    = torch.amp.GradScaler("cuda")
 
     best_val_loss = float("inf")

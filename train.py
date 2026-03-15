@@ -1,3 +1,4 @@
+#orginally built with hand but used ai to generate graphs
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split

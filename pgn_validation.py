@@ -1,16 +1,11 @@
 # convert_pgn.py
-# Optimized for winning — bot learns to WIN not draw
-# Strategy:
-#   - Only decisive games for full position extraction
-#   - Draws included minimally just for balance
-#   - Late game winning positions oversampled
-#     (these are most instructive for winning technique)
+#built orginally by hand but needed ai for complex positions
+# Output: dataset.pt
 
 import chess
 import chess.pgn
 import torch
 import numpy as np
-from tqdm import tqdm
 import random
 
 def board_to_tensor(board):
@@ -42,32 +37,20 @@ def encode(board, result):
         result = -result
     return t, result
 
+def count_pieces(board):
+    """Total pieces on board — used for real endgame detection"""
+    return len(board.piece_map())
+
 def build_dataset(pgn_path="filtered.pgn", output="dataset.pt"):
 
-    # Three buckets — treated very differently
-    winning_positions  = []   # from decisive games — FULL game kept
-    winning_scores     = []
-    winning_fens       = []
-    winning_turns      = []
-
-    # Late game winning positions — extra valuable
-    # when a player converts a won endgame
-    # model learns winning technique specifically
-    endgame_positions  = []
-    endgame_scores     = []
-    endgame_fens       = []
-    endgame_turns      = []
-
-    draw_positions     = []   # minimal inclusion for stability
-    draw_scores        = []
-    draw_fens          = []
-    draw_turns         = []
+    decisive_mid  = []   # decisive games, middlegame (moves 10-40)
+    decisive_end  = []   # decisive games, real endgame (≤12 pieces)
+    draw_early    = []   # draw games, early only (moves 10-25)
 
     result_map = {"1-0": 1.0, "0-1": -1.0, "1/2-1/2": 0.0}
+    n_white = n_black = n_draw = 0
 
     print(f"Building win-focused dataset from {pgn_path}...")
-
-    n_white = n_black = n_draw = 0
 
     with open(pgn_path) as f:
         game_count = 0
@@ -81,138 +64,126 @@ def build_dataset(pgn_path="filtered.pgn", output="dataset.pt"):
                 continue
 
             is_decisive = result != 0.0
-            if result == 1.0:  n_white += 1
+            if result ==  1.0: n_white += 1
             if result == -1.0: n_black += 1
-            if result == 0.0:  n_draw  += 1
-
-            # Count total moves for endgame detection
-            moves_list = list(game.mainline_moves())
-            total_moves = len(moves_list)
+            if result ==  0.0: n_draw  += 1
 
             board = game.board()
-            for i, move in enumerate(moves_list):
+            for i, move in enumerate(game.mainline_moves()):
                 board.push(move)
 
                 if i < 10:      continue
                 if i % 3 != 0: continue
                 if board.is_game_over(): continue
 
-                is_white  = board.turn == chess.WHITE
-                t, label  = encode(board, result)
+                is_white     = board.turn == chess.WHITE
+                t, label     = encode(board, result)
+                piece_count  = count_pieces(board)
+
+                # Real endgame detection — based on pieces not move number
+                # ≤12 pieces = both sides down to endgame material
+                # This works regardless of game length
+                is_real_endgame = piece_count <= 12
 
                 if is_decisive:
-                    # Is this a late game position?
-                    # Last 30% of moves in a decisive game
-                    # = winning technique phase
-                    is_endgame = i > total_moves * 0.7
-
-                    if is_endgame:
-                        # Store separately for heavy oversampling
-                        endgame_positions.append(t)
-                        endgame_scores.append(label)
-                        endgame_fens.append(board.fen())
-                        endgame_turns.append(1.0 if is_white else 0.0)
+                    if is_real_endgame:
+                        # Real endgame of decisive game
+                        # Most instructive for winning technique
+                        decisive_end.append((t, label, board.fen(),
+                                             1.0 if is_white else 0.0))
                     else:
-                        winning_positions.append(t)
-                        winning_scores.append(label)
-                        winning_fens.append(board.fen())
-                        winning_turns.append(1.0 if is_white else 0.0)
-
+                        # Opening/middlegame of decisive game
+                        decisive_mid.append((t, label, board.fen(),
+                                             1.0 if is_white else 0.0))
                 else:
-                    # Draws: only keep opening/early middlegame
-                    # move 10-30 only — structural understanding
+                    # Draw games — only early positions
+                    # moves 10-25 = opening structure only
                     # nothing from drawn endgames
-                    if 10 <= i <= 30:
-                        draw_positions.append(t)
-                        draw_scores.append(label)
-                        draw_fens.append(board.fen())
-                        draw_turns.append(1.0 if is_white else 0.0)
+                    if i <= 25:
+                        draw_early.append((t, label, board.fen(),
+                                           1.0 if is_white else 0.0))
 
             game_count += 1
             if game_count % 500 == 0:
                 print(f"  {game_count} games | "
-                      f"winning: {len(winning_positions):,} | "
-                      f"endgame: {len(endgame_positions):,} | "
-                      f"draws: {len(draw_positions):,}")
+                      f"dec_mid={len(decisive_mid):,} | "
+                      f"dec_end={len(decisive_end):,} | "
+                      f"draws={len(draw_early):,}")
 
-    print(f"\nGames:  total={game_count}  "
-          f"white={n_white}  black={n_black}  draw={n_draw}")
+    print(f"\nGames: {game_count} "
+          f"(white={n_white} black={n_black} draw={n_draw})")
     print(f"\nRaw positions:")
-    print(f"  Winning (mid):    {len(winning_positions):,}")
-    print(f"  Winning (end):    {len(endgame_positions):,}")
-    print(f"  Draws (early):    {len(draw_positions):,}")
+    print(f"  Decisive mid:   {len(decisive_mid):,}")
+    print(f"  Decisive end:   {len(decisive_end):,}")
+    print(f"  Draw early:     {len(draw_early):,}")
 
-    # ── Sampling strategy ─────────────────────────────────────────────────────
+    # ── Sampling ──────────────────────────────────────────────────────────────
+    # Keep ALL decisive middlegame positions
+    # Keep ALL decisive endgame positions — don't oversample by repeating
+    # Instead just cap draws aggressively
     #
-    # Target composition:
-    #   50% — regular winning positions (middlegame of decisive games)
-    #   30% — endgame winning positions (oversampled 3x)
-    #          model really needs to learn how to convert wins
-    #   20% — early draw positions (just enough for opening structure)
+    # Why not repeat endgame positions 3x?
+    # Repeating exact positions = model memorizes them
+    # = overfitting not learning
+    # Better to just reduce draws than repeat decisive
     #
-    # Why oversample endgames:
-    #   Converting a won position is the hardest thing for bots
-    #   They often let wins slip into draws
-    #   Seeing more "this was +0.8 and they converted it" teaches
-    #   the bot that winning positions require active play not shuffling
+    # Target: 80% decisive, 20% draws
 
-    n_winning  = len(winning_positions)
-    n_endgame  = len(endgame_positions)
+    n_decisive_total = len(decisive_mid) + len(decisive_end)
 
-    # Cap draws at 40% of winning total
-    # enough to learn openings, not enough to dominate
-    max_draws  = int(n_winning * 0.4)
-    if len(draw_positions) > max_draws:
-        indices        = random.sample(range(len(draw_positions)), max_draws)
-        draw_positions = [draw_positions[i] for i in indices]
-        draw_scores    = [draw_scores[i]    for i in indices]
-        draw_fens      = [draw_fens[i]      for i in indices]
-        draw_turns     = [draw_turns[i]     for i in indices]
+    # Cap draws at 25% of decisive total
+    # = roughly 20% of final dataset
+    max_draws = int(n_decisive_total * 0.25)
 
-    # Oversample endgame positions 3x
-    # repeat them so model sees them more often during training
-    endgame_positions = endgame_positions * 3
-    endgame_scores    = endgame_scores    * 3
-    endgame_fens      = endgame_fens      * 3
-    endgame_turns     = endgame_turns     * 3
+    if len(draw_early) > max_draws:
+        print(f"\nCapping draws: {len(draw_early):,} → {max_draws:,}")
+        draw_early = random.sample(draw_early, max_draws)
 
-    # Combine all
-    all_positions = winning_positions + endgame_positions + draw_positions
-    all_scores    = winning_scores    + endgame_scores    + draw_scores
-    all_fens      = winning_fens      + endgame_fens      + draw_fens
-    all_turns     = winning_turns     + endgame_turns     + draw_turns
+    # Combine
+    all_data = decisive_mid + decisive_end + draw_early
+    random.shuffle(all_data)
 
-    # Shuffle
-    combined = list(zip(all_positions, all_scores, all_fens, all_turns))
-    random.shuffle(combined)
-    all_positions, all_scores, all_fens, all_turns = zip(*combined)
+    # Unzip
+    all_positions, all_scores, all_fens, all_turns = zip(*all_data)
 
-    # Stats
-    n_total    = len(all_positions)
-    n_dec_tot  = len(winning_positions) + len(endgame_positions)
-    n_draw_tot = len(draw_positions)
+    n_total     = len(all_data)
+    n_dec       = len(decisive_mid) + len(decisive_end)
+    n_draw_kept = len(draw_early)
 
-    print(f"\nFinal dataset composition:")
-    print(f"  Total:            {n_total:,}")
-    print(f"  Decisive (mid):   {len(winning_positions):,}  "
-          f"({len(winning_positions)/n_total*100:.1f}%)")
-    print(f"  Decisive (end×3): {len(endgame_positions):,}  "
-          f"({len(endgame_positions)/n_total*100:.1f}%)")
-    print(f"  Draws (capped):   {n_draw_tot:,}  "
-          f"({n_draw_tot/n_total*100:.1f}%)")
-    print(f"\n  Decisive total:   {n_dec_tot:,}  "
-          f"({n_dec_tot/n_total*100:.1f}%)")
-    print(f"  Draw total:       {n_draw_tot:,}  "
-          f"({n_draw_tot/n_total*100:.1f}%)")
+    print(f"\nFinal dataset:")
+    print(f"  Total:          {n_total:,}")
+    print(f"  Decisive mid:   {len(decisive_mid):,} "
+          f"({len(decisive_mid)/n_total*100:.1f}%)")
+    print(f"  Decisive end:   {len(decisive_end):,} "
+          f"({len(decisive_end)/n_total*100:.1f}%)")
+    print(f"  Draws:          {n_draw_kept:,} "
+          f"({n_draw_kept/n_total*100:.1f}%)")
+    print(f"\n  Decisive total: {n_dec:,} ({n_dec/n_total*100:.1f}%)")
+    print(f"  Draw total:     {n_draw_kept:,} "
+          f"({n_draw_kept/n_total*100:.1f}%)")
 
+    # ── Sanity check — verify no draws are labeled as wins ────────────────────
+    # This directly answers your question
+    score_arr = np.array(list(all_scores))
+    print(f"\nLabel sanity check:")
+    print(f"  Min score:      {score_arr.min():.3f}  (should be -1.0)")
+    print(f"  Max score:      {score_arr.max():.3f}  (should be +1.0)")
+    print(f"  Mean score:     {score_arr.mean():.3f} (should be near 0)")
+    print(f"  Scores == 0:    {(score_arr == 0.0).sum():,}  (draws)")
+    print(f"  Scores == 1:    {(score_arr == 1.0).sum():,}  (winning)")
+    print(f"  Scores == -1:   {(score_arr == -1.0).sum():,} (losing)")
+    print(f"  Other scores:   {((score_arr != 0) & (score_arr != 1) & (score_arr != -1)).sum():,}")
+    # Should be 0 — no draw position should have label 1.0 or -1.0
+
+    # ── Save ──────────────────────────────────────────────────────────────────
     print("\nConverting to tensors...")
     data = {
         "positions": torch.tensor(
-            np.array(all_positions), dtype=torch.float32
+            np.array(list(all_positions)), dtype=torch.float32
         ),
         "scores": torch.tensor(list(all_scores), dtype=torch.float32),
         "fens":   list(all_fens),
-        "turns":  torch.tensor(list(all_turns),  dtype=torch.float32)
+        "turns":  torch.tensor(list(all_turns), dtype=torch.float32)
     }
 
     torch.save(data, output)

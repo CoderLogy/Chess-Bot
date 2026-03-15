@@ -1,6 +1,6 @@
 # Tests how often your net agrees with Stockfish
 # on which move is best
-
+#built with ai
 import chess
 import chess.engine
 import torch

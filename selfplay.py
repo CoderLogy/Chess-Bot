@@ -1,10 +1,10 @@
 # selfplay.py
-# Run AFTER retrain.py finishes
-# Bot plays itself at depth 4
-# Each position labeled by Stockfish depth 8
-# Same label quality as sf_dataset.pt — won't undo retrain gains
+# originally built with hand but used ai to generate graphs
 # Continuously improves evaluator.pt
 # Ctrl+C saves and exits cleanly
+# Search depth 2 — fast self-play
+# SF label depth 4 — accurate enough, 3x faster than depth 8
+# QS depth 3 — catches recaptures, bounded
 
 import chess
 import chess.engine
@@ -17,31 +17,27 @@ import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use("Agg")
 
-SF_PATH = "stockfish.exe"  
-# Must match train.py exactly
+SF_PATH = "stockfish.exe"
+
+# ── Model — must match train.py exactly ──────────────────────────────────────
 class Evaluator(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
             nn.Flatten(),
-
             nn.Linear(12 * 8 * 8, 1024),
             nn.BatchNorm1d(1024),
             nn.ReLU(),
             nn.Dropout(0.3),
-
             nn.Linear(1024, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.2),
-
             nn.Linear(512, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(),
-
             nn.Linear(256, 64),
             nn.ReLU(),
-
             nn.Linear(64, 1),
             nn.Tanh(),
         )
@@ -49,21 +45,16 @@ class Evaluator(nn.Module):
     def forward(self, x):
         return self.net(x).squeeze(-1)
 
+# ── Board encoding — must match convert_pgn.py exactly ───────────────────────
 def board_to_tensor(board):
     tensor = np.zeros((12, 8, 8), dtype=np.float32)
     piece_idx = {
-        (chess.PAWN,   True):  0,
-        (chess.KNIGHT, True):  1,
-        (chess.BISHOP, True):  2,
-        (chess.ROOK,   True):  3,
-        (chess.QUEEN,  True):  4,
-        (chess.KING,   True):  5,
-        (chess.PAWN,   False): 6,
-        (chess.KNIGHT, False): 7,
-        (chess.BISHOP, False): 8,
-        (chess.ROOK,   False): 9,
-        (chess.QUEEN,  False): 10,
-        (chess.KING,   False): 11,
+        (chess.PAWN,   True):  0, (chess.PAWN,   False): 6,
+        (chess.KNIGHT, True):  1, (chess.KNIGHT, False): 7,
+        (chess.BISHOP, True):  2, (chess.BISHOP, False): 8,
+        (chess.ROOK,   True):  3, (chess.ROOK,   False): 9,
+        (chess.QUEEN,  True):  4, (chess.QUEEN,  False): 10,
+        (chess.KING,   True):  5, (chess.KING,   False): 11,
     }
     for sq, p in board.piece_map().items():
         r, c = divmod(sq, 8)
@@ -80,10 +71,6 @@ def encode_board(board):
 # ── Setup ─────────────────────────────────────────────────────────────────────
 device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model     = Evaluator().to(device)
-
-# Very low lr — fine-tuning already trained weights
-# 1e-6 not 1e-5 — selfplay labels still noisier than retrain.py
-# because positions come from bot vs itself not 2200+ ELO games
 optimizer = torch.optim.AdamW(
     model.parameters(),
     lr           = 1e-6,
@@ -100,11 +87,10 @@ except FileNotFoundError:
     print("ERROR: evaluator.pt not found — run retrain.py first")
     sys.exit(1)
 
-# Open Stockfish once at startup
 try:
     sf = chess.engine.SimpleEngine.popen_uci(SF_PATH)
-    sf.configure({"Threads": 4, "Hash": 256})
-    print("Stockfish opened for position labeling at depth 8")
+    sf.configure({"Threads": 2, "Hash": 128})
+    print("Stockfish opened for position labeling at depth 4")
 except Exception as e:
     print(f"ERROR: could not open Stockfish — {e}")
     sys.exit(1)
@@ -135,13 +121,11 @@ def plot_selfplay_charts(game_num):
     # Plot 2 — Predicted vs Actual
     ax = axes[0, 1]
     if chart_all_preds:
-        recent_preds  = chart_all_preds[-5000:]
-        recent_labels = chart_all_labels[-5000:]
-        ax.scatter(recent_labels, recent_preds,
+        ax.scatter(chart_all_labels[-5000:], chart_all_preds[-5000:],
                    alpha=0.05, s=1, color="steelblue")
         ax.plot([-1, 1], [-1, 1], "r--", linewidth=2, label="Perfect")
-    ax.set_title("Predicted vs Actual (last 5000 positions)")
-    ax.set_xlabel("SF Score depth 8 (actual)")
+    ax.set_title("Predicted vs Actual (last 5000)")
+    ax.set_xlabel("SF Score depth 4 (actual)")
     ax.set_ylabel("Model Score (predicted)")
     ax.legend()
     ax.grid(True)
@@ -149,12 +133,10 @@ def plot_selfplay_charts(game_num):
     # Plot 3 — Score distribution
     ax = axes[0, 2]
     if chart_all_preds:
-        recent_preds  = chart_all_preds[-5000:]
-        recent_labels = chart_all_labels[-5000:]
-        ax.hist(recent_preds,  bins=60, alpha=0.7,
+        ax.hist(chart_all_preds[-5000:],  bins=60, alpha=0.7,
                 label="Predictions", color="steelblue")
-        ax.hist(recent_labels, bins=60, alpha=0.7,
-                label="SF labels d8", color="orange")
+        ax.hist(chart_all_labels[-5000:], bins=60, alpha=0.7,
+                label="SF labels d4", color="orange")
     ax.set_title("Score Distribution (last 5000)")
     ax.set_xlabel("Score")
     ax.set_ylabel("Count")
@@ -164,9 +146,9 @@ def plot_selfplay_charts(game_num):
     # Plot 4 — Error distribution
     ax = axes[1, 0]
     if chart_all_preds:
-        recent_preds  = np.array(chart_all_preds[-5000:])
-        recent_labels = np.array(chart_all_labels[-5000:])
-        errors        = recent_preds - recent_labels
+        rp     = np.array(chart_all_preds[-5000:])
+        rl     = np.array(chart_all_labels[-5000:])
+        errors = rp - rl
         ax.hist(errors, bins=60, color="purple", alpha=0.8)
         ax.axvline(0, color="red", linestyle="--", label="Zero error")
         ax.axvline(errors.mean(), color="orange", linestyle="--",
@@ -196,21 +178,18 @@ def plot_selfplay_charts(game_num):
     # Plot 6 — Summary
     ax = axes[1, 2]
     ax.axis("off")
-
     recent_loss = np.mean(chart_losses[-10:]) if chart_losses else 0
-    best_loss   = min(chart_losses) if chart_losses else 0
+    best_loss   = min(chart_losses)           if chart_losses else 0
     total_pos   = sum(chart_pos_per_game)
 
     if chart_all_preds:
-        recent_preds  = np.array(chart_all_preds[-5000:])
-        recent_labels = np.array(chart_all_labels[-5000:])
-        errors        = recent_preds - recent_labels
-        mae           = np.abs(errors).mean()
-        rmse          = np.sqrt((errors**2).mean())
-        bias          = errors.mean()
-        pred_std      = recent_preds.std()
-        label_std     = recent_labels.std()
-        spread        = pred_std / label_std if label_std > 0 else 0
+        rp     = np.array(chart_all_preds[-5000:])
+        rl     = np.array(chart_all_labels[-5000:])
+        e      = rp - rl
+        mae    = np.abs(e).mean()
+        rmse   = np.sqrt((e**2).mean())
+        bias   = e.mean()
+        spread = rp.std() / rl.std() if rl.std() > 0 else 0
     else:
         mae = rmse = bias = spread = 0
 
@@ -223,13 +202,13 @@ def plot_selfplay_charts(game_num):
         f"RMSE (recent):    {rmse:.4f}\n"
         f"Bias (recent):    {bias:.4f}\n"
         f"Spread ratio:     {spread:.2f}\n\n"
-        f"SF label depth:   8\n"
-        f"Search depth:     4\n"
+        f"SF label depth:   4\n"
+        f"Search depth:     2\n"
+        f"QS depth:         3\n"
         f"LR:               1e-6\n\n"
         f"Chart updates:    every 10 games\n"
         f"Saves:            every 100 games"
     )
-
     ax.text(
         0.1, 0.9, summary, transform=ax.transAxes,
         fontsize=11, verticalalignment="top", fontfamily="monospace",
@@ -246,7 +225,7 @@ def plot_selfplay_charts(game_num):
     plt.close(fig)
     print(f"  Chart saved → selfplay_progress.png")
 
-# ── Scoring ───────────────────────────────────────────────────────────────────
+# ── Neural net scoring ────────────────────────────────────────────────────────
 def nn_score(board):
     """Used for move selection — not for labels"""
     if board.is_checkmate():             return -100000
@@ -260,22 +239,19 @@ def nn_score(board):
 
 def sf_score(board):
     """
-    Stockfish labels at depth 8
-    More accurate than depth 4 used in generate_sf_labels.py
+    Stockfish evaluates position at depth 4
     Returns score from current player's perspective
     Matches encode_board() convention exactly
+    Depth 4 = 0.05s per position — fast enough for self-play
     """
     if board.is_game_over():
         return None
     try:
-        info  = sf.analyse(board, chess.engine.Limit(depth=8))
+        info  = sf.analyse(board, chess.engine.Limit(depth=4))
         score = info["score"].white().score(mate_score=10000)
         if score is None:
             return None
-        # Normalize to -1 to +1
         score = float(max(-1.0, min(1.0, score / 1000.0)))
-        # Flip to current player's perspective
-        # matches encode_board() which flips Black positions
         if board.turn == chess.BLACK:
             score = -score
         return score
@@ -283,31 +259,24 @@ def sf_score(board):
         return None
 
 # ── Search ────────────────────────────────────────────────────────────────────
-def quiescence(board, alpha, beta, maximizing):
+def quiescence(board, alpha, beta, maximizing, qs_depth=3):
     """
-    Extends search on captures only after depth runs out
-    Prevents horizon effect — missing obvious recaptures
-    Example without quiescence:
-      Bot captures queen, search stops, says +900
-      Next move opponent recaptures, real result -200
-    With quiescence:
-      Keeps searching captures until quiet position
-      Sees the recapture coming, avoids blunder
+    Extends search on captures only after main depth runs out
+    qs_depth=3 catches all meaningful recaptures
+    Bounded to prevent exponential blowup in tactical positions
     """
     stand_pat = nn_score(board)
+
+    if qs_depth == 0:
+        return stand_pat
 
     if maximizing:
         if stand_pat >= beta:
             return beta
         alpha = max(alpha, stand_pat)
-        captures = sorted(
-            [m for m in board.legal_moves if board.is_capture(m)],
-            key=lambda m: board.is_capture(m),
-            reverse=True
-        )
-        for move in captures:
+        for move in (m for m in board.legal_moves if board.is_capture(m)):
             board.push(move)
-            score = quiescence(board, alpha, beta, False)
+            score = quiescence(board, alpha, beta, False, qs_depth - 1)
             board.pop()
             alpha = max(alpha, score)
             if alpha >= beta:
@@ -317,14 +286,9 @@ def quiescence(board, alpha, beta, maximizing):
         if stand_pat <= alpha:
             return alpha
         beta = min(beta, stand_pat)
-        captures = sorted(
-            [m for m in board.legal_moves if board.is_capture(m)],
-            key=lambda m: board.is_capture(m),
-            reverse=True
-        )
-        for move in captures:
+        for move in (m for m in board.legal_moves if board.is_capture(m)):
             board.push(move)
-            score = quiescence(board, alpha, beta, True)
+            score = quiescence(board, alpha, beta, True, qs_depth - 1)
             board.pop()
             beta = min(beta, score)
             if beta <= alpha:
@@ -335,10 +299,7 @@ def alpha_beta(board, depth, alpha, beta, maximizing):
     if board.is_game_over():
         return nn_score(board)
     if depth == 0:
-        # Call quiescence instead of nn_score directly
-        # this is the key fix for tactical blunders
         return quiescence(board, alpha, beta, maximizing)
-
     moves = sorted(
         board.legal_moves,
         key=lambda m: (board.is_capture(m), board.gives_check(m)),
@@ -363,8 +324,11 @@ def alpha_beta(board, depth, alpha, beta, maximizing):
             if beta <= alpha: break
         return value
 
-def pick_move(board, depth=4):
-    """Search at depth 4 — stronger than depth 2"""
+def pick_move(board, depth=2):
+    """
+    Depth 2 for self-play — fast enough for many games per hour
+    Self-play quality matters less than quantity for training
+    """
     best, best_val = None, -float('inf')
     for move in board.legal_moves:
         board.push(move)
@@ -375,24 +339,23 @@ def pick_move(board, depth=4):
     return best
 
 # ── Self play ─────────────────────────────────────────────────────────────────
-def play_one_game(depth=4, max_moves=150):
+def play_one_game(max_moves=150):
     """
-    Bot plays itself at depth 4
-    Each position labeled by SF depth 8
-    NOT by game outcome — key fix from old version
+    Bot plays itself at depth 2
+    Each position labeled by SF depth 4
+    NOT by game outcome — accurate continuous labels
     """
     board   = chess.Board()
     samples = []
     moves   = 0
 
     while not board.is_game_over() and moves < max_moves:
-        move = pick_move(board, depth=depth)
+        move = pick_move(board, depth=2)
         if move is None:
             break
 
-        # Label BEFORE pushing move
         encoded = encode_board(board)
-        label   = sf_score(board)   # SF depth 8 label
+        label   = sf_score(board)
 
         if label is not None:
             samples.append((encoded, label))
@@ -446,21 +409,24 @@ signal.signal(signal.SIGINT, save_and_exit)
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 print(f"Self-play running on {device}")
-print(f"Search depth:    4")
-print(f"SF label depth:  8")
-print(f"LR:              1e-6")
-print(f"Charts saved to: selfplay_progress.png every 10 games")
+print(f"Search depth:    2  (fast, ~0.3s per move)")
+print(f"SF label depth:  4  (accurate, ~0.05s per position)")
+print(f"QS depth:        3  (bounded recapture search)")
+print(f"LR:              1e-6  (gentle fine-tuning)")
+print(f"Est. game time:  ~15-20 seconds per game")
+print(f"Est. per hour:   ~180-240 games")
+print(f"Charts:          selfplay_progress.png every 10 games")
+print(f"Checkpoints:     evaluator.pt every 100 games")
 print("Press Ctrl+C to stop and save\n")
 
 total_samples = 0
 
 while True:
     game_num += 1
-    samples              = play_one_game(depth=4)
+    samples              = play_one_game()
     loss, preds, labels  = train_on_game(samples)
     total_samples       += len(samples)
 
-    # Update chart data
     chart_losses.append(loss)
     chart_game_nums.append(game_num)
     chart_pos_per_game.append(len(samples))

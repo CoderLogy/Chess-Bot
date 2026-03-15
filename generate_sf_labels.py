@@ -1,7 +1,4 @@
-# generate_sf_labels.py
-# Reads dataset.pt directly
-# Uses stored FENs for accurate board reconstruction
-# Uses stored turns to flip SF score to current player's perspective
+#built with ai
 # Random sampling — not just first 500k positions
 
 import chess
@@ -33,12 +30,12 @@ def generate(
 
     # Estimate time — depth 8 takes ~0.15s per position
     secs_per_pos = 0.05 if sf_depth <= 4 else 0.15
-    est_hours    = total * secs_per_pos / 3600
+    est_mins    = total * secs_per_pos / 3600
 
     print(f"Loaded {len(positions):,} positions total")
     print(f"Will evaluate {total:,} positions")
     print(f"Stockfish depth:  {sf_depth}")
-    print(f"Estimated time:   {est_hours:.1f} hours")
+    print(f"Estimated time:   {est_mins:.1f} mins")
     print(f"  (depth 8 is ~3x slower than depth 4)\n")
 
     sf_positions = []
